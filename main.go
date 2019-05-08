@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
-	"log"
-	"os/exec"
 	"strings"
 
-	"github.com/richterrettich/changelog/domain"
+	"github.com/richterrettich/git-changelog/domain"
+	"gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	"gopkg.in/src-d/go-git.v4/plumbing/storer"
 )
 
 func main() {
@@ -17,82 +17,67 @@ func main() {
 	var to = flag.String("to", "", "endpoint for changelog generation")
 	var dir = flag.String("dir", ".", "the directory the git repository is located")
 	flag.Parse()
-	groupedCommits := groupConsumer(objectPipe(source(*dir, *from, *to)))
+	groupedCommits := groupConsumer(source(*dir, *from, *to))
 	printMarkdown(groupedCommits)
 
 }
 
-func source(dir, from, to string) <-chan string {
-	var cmd *exec.Cmd
-	if to == "" {
-		cmd = exec.Command("git", "-C", dir, "log", `--pretty=format:hash: %H%n-----%nauthor: %an <%ae>%n-----%nrawSubject: %s%n-----%nrawBody: %b%n-----%nEND-COMMIT%n`, from)
-	} else {
-		cmd = exec.Command("git", "-C", dir, "log", `--pretty=format:hash: %H%n-----%nauthor: %an <%ae>%n-----%nrawSubject: %s%n-----%nrawBody: %b%n-----%nEND-COMMIT%n`, to+".."+from)
-	}
+func source(dir, from, to string) <-chan *domain.Commit {
 
-	outputChannel := make(chan string)
-
-	output, err := cmd.StdoutPipe()
-	if err != nil {
-		panic(err)
-	}
-	err = cmd.Start()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	go func() {
-		scanner := bufio.NewScanner(output)
-		for scanner.Scan() {
-			outputChannel <- scanner.Text()
-		}
-		defer output.Close()
-		close(outputChannel)
-		if err := scanner.Err(); err != nil {
-			log.Fatal(err)
-		}
-	}()
-	return outputChannel
-}
-
-func objectPipe(input <-chan string) <-chan *domain.Commit {
 	outputChannel := make(chan *domain.Commit)
+
 	go func() {
-		chunk := ""
-		result := &domain.Commit{}
-		for line := range input {
-			if line == "-----" {
-				processChunk(chunk, result)
-				chunk = ""
-			} else {
-				chunk = chunk + "\n" + line
-			}
-			if line == "END-COMMIT" {
-				result.ParseBody()
-				result.ParseSubject()
-				outputChannel <- result
-				result = &domain.Commit{}
-			}
+
+		repo, err := git.PlainOpen(dir)
+
+		tagsIter, err := repo.Tags()
+
+		if err != nil {
+			panic(err)
 		}
-		close(outputChannel)
+
+		firstTag, err := tagsIter.Next()
+
+		if err != nil {
+			panic(err)
+		}
+
+		commits, err := repo.Log(&git.LogOptions{})
+		if err != nil {
+			panic(err)
+		}
+
+		commits.ForEach(func(o *object.Commit) error {
+			if o.ID() == firstTag.Hash() {
+				return storer.ErrStop
+			}
+
+			parts := strings.Split(o.Message, "\n")
+			subject := parts[0]
+			body := ""
+			if len(parts) > 1 {
+				body = strings.Join(parts[1:len(parts)], "\n")
+			}
+			result := &domain.Commit{
+				RawSubject:      subject,
+				RawBody:         body,
+				Author:          o.Author.Email,
+				Hash:            o.ID().String(),
+				Solves:          make([]string, 0),
+				BreakingChanges: make([]string, 0),
+				Context:         make([]string, 0),
+				Errors:          make([]error, 0),
+			}
+
+			result.ParseSubject()
+			result.ParseBody()
+
+			outputChannel <- result
+			return nil
+		})
+
 	}()
 	return outputChannel
-}
-
-func processChunk(chunk string, obj *domain.Commit) {
-	chunk = strings.TrimSpace(chunk)
-	parts := strings.Split(chunk, ":")
-	key, value := parts[0], strings.Join(parts[1:], ":")
-	switch key {
-	case "hash":
-		obj.Hash = value
-	case "rawSubject":
-		obj.RawSubject = value
-	case "author":
-		obj.Author = value
-	case "rawBody":
-		obj.RawBody = value
-	}
 }
 
 func groupConsumer(input <-chan *domain.Commit) map[domain.CommitType][]*domain.Commit {
